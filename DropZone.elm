@@ -15,8 +15,9 @@ module Extra.DropZone exposing
 
 -}
 
+-- import Api.Errors
+
 import Api.Data as Data exposing (Data)
-import Api.Errors
 import Colors
 import Element exposing (..)
 import Element.Background as Background
@@ -24,45 +25,65 @@ import Element.Border as Border
 import Element.Events
 import Element.Font as Font
 import Element.Input as Input
+import Extra.Mime as Mime
 import FeatherIcons
 import File exposing (File)
 import File.Select
 import Html
+import Html.Attributes
 import Html.Events
 import Http
 import Json.Decode
-import Mime
 import Process
 import Shared
 import Svg
 import Svg.Attributes
 import Task
-import UI
 
 
-type Model image
+
+-- import UI
+
+
+type Model auth image
     = Model
         { highlightDropzone : Bool
         , files : List FileUpload
         , uid : Int
-        , uploadImageEndpoint :
-            Shared.Auth
-            ->
-                { file : File.File
-                , tracker : String
-                , onResponse : Data image -> InnerMsg image
-                }
-            -> Cmd (InnerMsg image)
+        , uploadImageEndpoint : UploadMethod auth image
+        , bgColor : Color
+        , color : Color
         }
 
 
+type UploadMethod auth image
+    = HttpUpload
+        (auth
+         ->
+            { file : File.File
+            , tracker : String
+            , onResponse : Data image -> InnerMsg image
+            }
+         -> Cmd (InnerMsg image)
+        )
+    | PortUpload (String -> File.File -> Cmd (InnerMsg image))
+
+
+init : { uploadImageEndpoint : UploadMethod auth image, bgColor : Color, color : Color } -> Model auth image
 init opts =
     Model
         { highlightDropzone = False
         , files = []
         , uid = 0
         , uploadImageEndpoint = opts.uploadImageEndpoint
+        , bgColor = opts.bgColor
+        , color = opts.color
         }
+
+
+destructiveRed : Color
+destructiveRed =
+    rgb255 209 11 27
 
 
 type alias FileUpload =
@@ -92,7 +113,7 @@ type InnerMsg image
     | UpdateUploadProgress String Http.Progress
 
 
-update : Shared.Auth -> InnerMsg image -> Model image -> ( Model image, Cmd (Msg image) )
+update : auth -> InnerMsg image -> Model auth image -> ( Model auth image, Cmd (Msg image) )
 update auth msg (Model model) =
     Tuple.mapFirst Model <|
         case msg of
@@ -141,11 +162,16 @@ update auth msg (Model model) =
                         (\uploadableFile ->
                             case uploadableFile.progress of
                                 InProgress _ ->
-                                    model.uploadImageEndpoint auth
-                                        { file = uploadableFile.file
-                                        , tracker = uploadableFile.tracker
-                                        , onResponse = UploadedFile uploadableFile.tracker
-                                        }
+                                    case model.uploadImageEndpoint of
+                                        HttpUpload endpoint ->
+                                            endpoint auth
+                                                { file = uploadableFile.file
+                                                , tracker = uploadableFile.tracker
+                                                , onResponse = UploadedFile uploadableFile.tracker
+                                                }
+
+                                        PortUpload portFn ->
+                                            portFn uploadableFile.tracker uploadableFile.file
 
                                 Failed _ ->
                                     Cmd.none
@@ -167,7 +193,7 @@ update auth msg (Model model) =
                                     if file.tracker == tracker then
                                         case ( file.progress, data ) of
                                             ( InProgress _, Data.Failure error ) ->
-                                                { file | progress = Failed ("Unable to complete upload: " ++ Api.Errors.stringForGenericErrors error) }
+                                                { file | progress = Failed ("Unable to complete upload: " ++ Data.stringForGenericErrors error) }
 
                                             ( _, Data.Success _ ) ->
                                                 { file | progress = InProgress 1 }
@@ -226,7 +252,7 @@ update auth msg (Model model) =
 -- SUBSCRIPTIONS
 
 
-subscriptions : Model image -> Sub (Msg image)
+subscriptions : Model auth image -> Sub (Msg image)
 subscriptions (Model model) =
     Sub.batch
         (model.files
@@ -243,12 +269,12 @@ subscriptions (Model model) =
         )
 
 
-viewDropzone : Model image -> Element (Msg image)
+viewDropzone : Model auth image -> Element (Msg image)
 viewDropzone (Model model) =
-    viewCustomDropzone (Model model) (el [ Font.color Colors.darkGreen, Font.size 21, Font.bold ] (text "Upload an image"))
+    viewCustomDropzone (Model model) (el [ Font.color model.color, Font.size 21, Font.bold ] (text "Upload an image"))
 
 
-viewCustomDropzone : Model image -> Element (InnerMsg image) -> Element (Msg image)
+viewCustomDropzone : Model auth image -> Element (InnerMsg image) -> Element (Msg image)
 viewCustomDropzone (Model model) text_ =
     let
         dropDecoder : Json.Decode.Decoder (InnerMsg image)
@@ -278,7 +304,7 @@ viewCustomDropzone (Model model) text_ =
                      else
                         0.3
                     )
-                    Colors.green
+                    model.bgColor
                 )
 
             -- , Element.Events.onMouseEnter StartDropZoneHighlight
@@ -302,7 +328,7 @@ viewCustomDropzone (Model model) text_ =
                             , Svg.Attributes.height "100%"
                             , Svg.Attributes.fillOpacity "0"
                             , Svg.Attributes.strokeWidth "2px"
-                            , Svg.Attributes.stroke (Colors.toString Colors.green)
+                            , Svg.Attributes.stroke (colorToString model.bgColor)
                             , Svg.Attributes.ry "8"
                             , Svg.Attributes.rx "8"
                             , Svg.Attributes.strokeDasharray "4, 8"
@@ -315,13 +341,13 @@ viewCustomDropzone (Model model) text_ =
                 )
             ]
             (row [ spacing 10, centerX, centerY ]
-                [ UI.customIcon FeatherIcons.image 24 Colors.darkGreen
+                [ customIcon FeatherIcons.image 24 model.color
                 , text_
                 ]
             )
 
 
-viewProgresses : Model image -> Element (Msg image)
+viewProgresses : Model auth image -> Element (Msg image)
 viewProgresses (Model model) =
     Element.map PickerChanged <|
         column [ width fill, spacing 8 ]
@@ -332,15 +358,16 @@ viewProgresses (Model model) =
                             InProgress progress ->
                                 el
                                     [ width fill
-                                    , Background.color (Colors.withAlpha 0.4 Colors.green)
+                                    , Background.color (Colors.withAlpha 0.4 model.bgColor)
                                     , Border.rounded 8
                                     , Border.width 1
-                                    , Border.color Colors.green
+                                    , Border.color model.bgColor
                                     , inFront
                                         (el
                                             [ height (px 4)
-                                            , UI.style "width" (String.fromInt (round (100 * progress)) ++ "%")
-                                            , Background.color (Colors.withAlpha 0.4 Colors.green)
+                                            , Html.Attributes.style "width" (String.fromInt (round (100 * progress)) ++ "%")
+                                                |> htmlAttribute
+                                            , Background.color (Colors.withAlpha 0.4 model.bgColor)
                                             , alignBottom
                                             ]
                                             none
@@ -358,7 +385,7 @@ viewProgresses (Model model) =
                                             ]
                                         , if round (progress * 100) == 100 then
                                             Input.button [ alignRight ]
-                                                { label = UI.customIcon FeatherIcons.x 24 Colors.darkGreen
+                                                { label = customIcon FeatherIcons.x 24 model.color
                                                 , onPress = Just (DismissFile file.tracker)
                                                 }
 
@@ -382,7 +409,7 @@ viewProgresses (Model model) =
                                             , el [ Font.size 13 ] (text (File.name file.file))
                                             ]
                                         , Input.button [ alignRight ]
-                                            { label = UI.customIcon FeatherIcons.x 24 Colors.destructiveRed
+                                            { label = customIcon FeatherIcons.x 24 destructiveRed
                                             , onPress = Just (DismissFile file.tracker)
                                             }
                                         ]
@@ -390,3 +417,27 @@ viewProgresses (Model model) =
                     )
                     model.files
             )
+
+
+customIcon : FeatherIcons.Icon -> Float -> Color -> Element msg
+customIcon icon size iconColor =
+    icon
+        |> FeatherIcons.withSize size
+        |> FeatherIcons.withStrokeWidth 2.4
+        |> FeatherIcons.toHtml []
+        |> html
+        |> el [ Font.color iconColor ]
+
+
+colorToString : Color -> String
+colorToString color =
+    let
+        o =
+            toRgb color
+    in
+    "rgba("
+        ++ String.fromInt (round (o.red * 255))
+        ++ ("," ++ String.fromInt (round (o.green * 255)))
+        ++ ("," ++ String.fromInt (round (o.blue * 255)))
+        ++ ("," ++ String.fromFloat o.alpha)
+        ++ ")"
